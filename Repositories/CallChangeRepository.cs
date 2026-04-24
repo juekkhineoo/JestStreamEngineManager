@@ -14,9 +14,10 @@ namespace JestStreamEngineManager.Repositories;
 /// <summary>
 /// Reads call change events from a NATS JetStream stream.
 /// Each message on the stream carries a <see cref="CallChangeEvent"/> as its JSON payload.
-/// The stream must already exist; this consumer uses an ephemeral pull consumer starting from the
-/// sequence after <paramref name="lastSequence"/> so that each polling cycle picks up exactly the
-/// messages that arrived since the previous cycle.
+/// Uses a durable pull consumer so that delivery state is preserved across polling cycles.
+/// The consumer is created once with <see cref="ConsumerConfigDeliverPolicy.LastPerSubject"/>
+/// and reused on every subsequent cycle — NATS advances the server-side cursor automatically
+/// as messages are acknowledged, so no deliver-policy mutation is ever needed.
 /// </summary>
 public sealed class CallChangeRepository : ICallChangeRepository, IAsyncDisposable, IDisposable
 {
@@ -66,24 +67,7 @@ public sealed class CallChangeRepository : ICallChangeRepository, IAsyncDisposab
 
         try
         {
-            var consumerConfig = new ConsumerConfig
-            {
-                DeliverPolicy = lastSequence == 0 ? ConsumerConfigDeliverPolicy.LastPerSubject : ConsumerConfigDeliverPolicy.ByStartSequence,
-                AckPolicy = ConsumerConfigAckPolicy.Explicit,
-                // FilterSubject intentionally omitted — the stream is already scoped to calls.>
-                // and the > wildcard is illegal in the consumer create API subject.
-                InactiveThreshold = TimeSpan.FromSeconds(60),
-                AckWait = TimeSpan.FromSeconds(30),
-                MaxDeliver = 5
-            };
-
-            if (lastSequence > 0)
-            {
-                consumerConfig.OptStartSeq = lastSequence + 1;
-            }
-
-            var consumer = await _jetStream!.CreateOrUpdateConsumerAsync(
-                _settings.JetStreamName, consumerConfig, cancellationToken);
+            var consumer = await GetOrCreateConsumerAsync(cancellationToken);
 
             var fetchOpts = new NatsJSFetchOpts
             {
@@ -127,7 +111,7 @@ public sealed class CallChangeRepository : ICallChangeRepository, IAsyncDisposab
         }
         catch (NatsJSApiException ex) when (ex.Error.Code == 404)
         {
-            // Stream does not exist yet — non-fatal, return empty result and wait for next cycle.
+            // Stream or consumer does not exist yet — non-fatal, return empty result.
             _logger.LogWarning("JetStream stream '{Stream}' not found. Returning empty result.", _settings.JetStreamName);
             return result;
         }
@@ -145,6 +129,64 @@ public sealed class CallChangeRepository : ICallChangeRepository, IAsyncDisposab
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// Returns the existing durable consumer if it already exists on the NATS server,
+    /// or creates it fresh with <see cref="ConsumerConfigDeliverPolicy.LastPerSubject"/>.
+    /// <para>
+    /// NATS prohibits mutating <c>DeliverPolicy</c> on an existing consumer, so
+    /// <c>CreateOrUpdateConsumerAsync</c> is only ever called when the consumer is absent.
+    /// On subsequent cycles the server-side cursor advances automatically as messages
+    /// are acknowledged — no sequence tracking in application code is required.
+    /// </para>
+    /// </summary>
+    private async Task<INatsJSConsumer> GetOrCreateConsumerAsync(CancellationToken cancellationToken)
+    {
+        // Attempt to bind to the existing durable consumer first.
+        try
+        {
+            var existing = await _jetStream!.GetConsumerAsync(
+                _settings.JetStreamName, _settings.JetStreamConsumerName, cancellationToken);
+
+            _logger.LogDebug(
+                "Reusing existing durable consumer '{Consumer}' on stream '{Stream}'",
+                _settings.JetStreamConsumerName, _settings.JetStreamName);
+
+            return existing;
+        }
+        catch (NatsJSApiException ex) when (ex.Error.Code == 404)
+        {
+            // Consumer does not exist yet — fall through to create it.
+            _logger.LogInformation(
+                "Durable consumer '{Consumer}' not found on stream '{Stream}'. Creating it now.",
+                _settings.JetStreamConsumerName, _settings.JetStreamName);
+        }
+
+        // '>' is a valid stream wildcard but illegal in a consumer FilterSubject.
+        // Translate "calls.>" → "calls.*" so NATS accepts the consumer creation request.
+        var filterSubject = BuildConsumerFilterSubject(_settings.JetStreamSubject);
+
+        var consumerConfig = new ConsumerConfig
+        {
+            Name = _settings.JetStreamConsumerName,
+            // Start from the last message per subject so the first cycle picks up the
+            // current state of every call rather than replaying the entire stream history.
+            DeliverPolicy = ConsumerConfigDeliverPolicy.LastPerSubject,
+            AckPolicy = ConsumerConfigAckPolicy.Explicit,
+            // Required by NATS when DeliverPolicy is LastPerSubject.
+            FilterSubject = filterSubject,
+            InactiveThreshold = TimeSpan.FromSeconds(60),
+            AckWait = TimeSpan.FromSeconds(30),
+            MaxDeliver = 5
+        };
+
+        _logger.LogDebug(
+            "Creating durable consumer '{Consumer}' on stream '{Stream}' with filter '{Filter}'",
+            _settings.JetStreamConsumerName, _settings.JetStreamName, filterSubject);
+
+        return await _jetStream!.CreateOrUpdateConsumerAsync(
+            _settings.JetStreamName, consumerConfig, cancellationToken);
     }
 
     private async Task ResetConnectionAsync()
@@ -263,5 +305,27 @@ public sealed class CallChangeRepository : ICallChangeRepository, IAsyncDisposab
         json = UnquotedKeyRegex.Replace(json, "\"$1\":");
         json = UnquotedValueRegex.Replace(json, m => $": \"{m.Groups[1].Value.Trim()}\"");
         return json;
+    }
+
+    /// <summary>
+    /// Converts a stream-level subject wildcard into a consumer-safe filter subject.
+    /// NATS consumers do not accept the multi-level <c>&gt;</c> wildcard in <c>FilterSubject</c>;
+    /// the single-level <c>*</c> wildcard is supported and covers the typical
+    /// <c>calls.&gt;</c> → <c>calls.*</c> pattern used here.
+    /// </summary>
+    /// <param name="streamSubject">The subject pattern from settings, e.g. <c>calls.&gt;</c>.</param>
+    /// <returns>A consumer-compatible filter subject, e.g. <c>calls.*</c>.</returns>
+    private static string BuildConsumerFilterSubject(string streamSubject)
+    {
+        // Replace a trailing ".>" with ".*" to produce a valid consumer filter subject.
+        if (streamSubject.EndsWith(".>", StringComparison.Ordinal))
+            return string.Concat(streamSubject.AsSpan(0, streamSubject.Length - 1), "*");
+
+        // Bare ">" means match everything — use "*" for a single-level equivalent.
+        if (streamSubject == ">")
+            return "*";
+
+        // Already a concrete subject or uses "*" — use as-is.
+        return streamSubject;
     }
 }
