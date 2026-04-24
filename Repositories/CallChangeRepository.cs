@@ -14,10 +14,26 @@ namespace JestStreamEngineManager.Repositories;
 /// <summary>
 /// Reads call change events from a NATS JetStream stream.
 /// Each message on the stream carries a <see cref="CallChangeEvent"/> as its JSON payload.
-/// Uses a durable pull consumer so that delivery state is preserved across polling cycles.
-/// The consumer is created once with <see cref="ConsumerConfigDeliverPolicy.LastPerSubject"/>
-/// and reused on every subsequent cycle — NATS advances the server-side cursor automatically
-/// as messages are acknowledged, so no deliver-policy mutation is ever needed.
+/// <para>
+/// Delivery strategy depends on <c>lastSequence</c> passed to <see cref="GetCallChangesSinceAsync"/>:
+/// <list type="bullet">
+///   <item>
+///     <term><c>lastSequence == 0</c></term>
+///     <description>
+///       Uses a durable pull consumer with <see cref="ConsumerConfigDeliverPolicy.LastPerSubject"/>
+///       and <see cref="ConsumerConfigAckPolicy.None"/> to obtain the current state of every
+///       call without replaying the entire stream history.
+///     </description>
+///   </item>
+///   <item>
+///     <term><c>lastSequence != 0</c></term>
+///     <description>
+///       Creates an ephemeral consumer with <see cref="ConsumerConfigDeliverPolicy.ByStartSequence"/>
+///       starting at <c>lastSequence + 1</c> so only genuinely new messages are returned.
+///     </description>
+///   </item>
+/// </list>
+/// </para>
 /// </summary>
 public sealed class CallChangeRepository : ICallChangeRepository, IAsyncDisposable, IDisposable
 {
@@ -67,7 +83,7 @@ public sealed class CallChangeRepository : ICallChangeRepository, IAsyncDisposab
 
         try
         {
-            var consumer = await GetOrCreateConsumerAsync(cancellationToken);
+            var consumer = await GetConsumerAsync(lastSequence, cancellationToken);
 
             var fetchOpts = new NatsJSFetchOpts
             {
@@ -132,16 +148,40 @@ public sealed class CallChangeRepository : ICallChangeRepository, IAsyncDisposab
     }
 
     /// <summary>
-    /// Returns the existing durable consumer if it already exists on the NATS server,
-    /// or creates it fresh with <see cref="ConsumerConfigDeliverPolicy.LastPerSubject"/>.
+    /// Returns the appropriate JetStream consumer based on <paramref name="lastSequence"/>:
+    /// <list type="bullet">
+    ///   <item>
+    ///     <term><c>0</c></term>
+    ///     <description>
+    ///       Reuses or creates the durable consumer with
+    ///       <see cref="ConsumerConfigDeliverPolicy.LastPerSubject"/> so the first cycle
+    ///       captures the current state of every call without a full history replay.
+    ///     </description>
+    ///   </item>
+    ///   <item>
+    ///     <term>non-zero</term>
+    ///     <description>
+    ///       Creates an ephemeral consumer with
+    ///       <see cref="ConsumerConfigDeliverPolicy.ByStartSequence"/> at
+    ///       <c>lastSequence + 1</c> so only new messages are delivered.
+    ///     </description>
+    ///   </item>
+    /// </list>
+    /// </summary>
+    private Task<INatsJSConsumer> GetConsumerAsync(ulong lastSequence, CancellationToken cancellationToken) =>
+        lastSequence == 0
+            ? GetOrCreateDurableConsumerAsync(cancellationToken)
+            : CreateEphemeralConsumerAsync(lastSequence, cancellationToken);
+
+    /// <summary>
+    /// Returns the existing durable consumer if present on the NATS server, or creates it
+    /// with <see cref="ConsumerConfigDeliverPolicy.LastPerSubject"/>.
     /// <para>
-    /// NATS prohibits mutating <c>DeliverPolicy</c> on an existing consumer, so
-    /// <c>CreateOrUpdateConsumerAsync</c> is only ever called when the consumer is absent.
-    /// On subsequent cycles the server-side cursor advances automatically as messages
-    /// are acknowledged — no sequence tracking in application code is required.
+    /// <see cref="ConsumerConfigAckPolicy.None"/> is used so NATS advances the server-side
+    /// cursor automatically on delivery — no explicit <c>AckAsync</c> call is required.
     /// </para>
     /// </summary>
-    private async Task<INatsJSConsumer> GetOrCreateConsumerAsync(CancellationToken cancellationToken)
+    private async Task<INatsJSConsumer> GetOrCreateDurableConsumerAsync(CancellationToken cancellationToken)
     {
         // Attempt to bind to the existing durable consumer first.
         try
@@ -163,8 +203,6 @@ public sealed class CallChangeRepository : ICallChangeRepository, IAsyncDisposab
                 _settings.JetStreamConsumerName, _settings.JetStreamName);
         }
 
-        // '>' is a valid stream wildcard but illegal in a consumer FilterSubject.
-        // Translate "calls.>" → "calls.*" so NATS accepts the consumer creation request.
         var filterSubject = BuildConsumerFilterSubject(_settings.JetStreamSubject);
 
         var consumerConfig = new ConsumerConfig
@@ -173,17 +211,52 @@ public sealed class CallChangeRepository : ICallChangeRepository, IAsyncDisposab
             // Start from the last message per subject so the first cycle picks up the
             // current state of every call rather than replaying the entire stream history.
             DeliverPolicy = ConsumerConfigDeliverPolicy.LastPerSubject,
-            AckPolicy = ConsumerConfigAckPolicy.Explicit,
+            // AckPolicy.None lets NATS advance the cursor automatically on delivery,
+            // removing the need for explicit AckAsync calls in the fetch loop.
+            AckPolicy = ConsumerConfigAckPolicy.None,
             // Required by NATS when DeliverPolicy is LastPerSubject.
             FilterSubject = filterSubject,
             InactiveThreshold = TimeSpan.FromSeconds(60),
-            AckWait = TimeSpan.FromSeconds(30),
-            MaxDeliver = 5
         };
 
         _logger.LogDebug(
             "Creating durable consumer '{Consumer}' on stream '{Stream}' with filter '{Filter}'",
             _settings.JetStreamConsumerName, _settings.JetStreamName, filterSubject);
+
+        return await _jetStream!.CreateOrUpdateConsumerAsync(
+            _settings.JetStreamName, consumerConfig, cancellationToken);
+    }
+
+    /// <summary>
+    /// Creates a short-lived ephemeral consumer that starts at <paramref name="lastSequence"/> + 1,
+    /// delivering only messages published after the last successfully processed sequence.
+    /// <para>
+    /// <c>FilterSubject</c> is intentionally omitted. The NATS 2.10+ consumer API encodes
+    /// the filter into the request subject (<c>$JS.API.CONSUMER.CREATE.&lt;stream&gt;.&lt;filter&gt;</c>),
+    /// but the .NET client only constructs that subject when a <c>Name</c> is provided.
+    /// For unnamed (ephemeral) consumers the client sends to the unfiltered endpoint, and the
+    /// server rejects any mismatch between the request subject and the config body.
+    /// Omitting the filter is safe: the stream itself is already scoped to
+    /// <see cref="JestStreamEngineManagerSettings.JetStreamSubject"/> so no foreign messages exist.
+    /// </para>
+    /// </summary>
+    private async Task<INatsJSConsumer> CreateEphemeralConsumerAsync(
+        ulong lastSequence,
+        CancellationToken cancellationToken)
+    {
+        var consumerConfig = new ConsumerConfig
+        {
+            // No Name — ephemeral consumer; NATS cleans it up automatically after InactiveThreshold.
+            DeliverPolicy = ConsumerConfigDeliverPolicy.ByStartSequence,
+            OptStartSeq = lastSequence + 1,
+            AckPolicy = ConsumerConfigAckPolicy.None,
+            // FilterSubject deliberately omitted — see summary above.
+            InactiveThreshold = TimeSpan.FromSeconds(30),
+        };
+
+        _logger.LogDebug(
+            "Creating ephemeral consumer on stream '{Stream}' starting at sequence {Seq}",
+            _settings.JetStreamName, lastSequence + 1);
 
         return await _jetStream!.CreateOrUpdateConsumerAsync(
             _settings.JetStreamName, consumerConfig, cancellationToken);
